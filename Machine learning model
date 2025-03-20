@@ -1,0 +1,120 @@
+import pandas as pd
+import numpy as np
+import os
+from kaggle.api.kaggle_api_extended import KaggleApi
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier, StackingClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from sklearn.metrics import log_loss, brier_score_loss, classification_report
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Initialize Kaggle API
+api = KaggleApi()
+api.authenticate()
+
+# Define Kaggle dataset path
+dataset = 'kagglecomp/ncaatourney'
+data_path = './data'
+os.makedirs(data_path, exist_ok=True)
+
+# Download datasets
+api.dataset_download_files(dataset, path=data_path, unzip=True)
+
+# Load datasets
+def load_csv(filename):
+    filepath = os.path.join(data_path, filename)
+    return pd.read_csv(filepath)
+
+teams = load_csv('MTeams.csv')
+seasons = load_csv('MSeasons.csv')
+regular_season_results = load_csv('MRegularSeasonCompactResults.csv')
+tourney_results = load_csv('MNCAATourneyCompactResults.csv')
+seeds = load_csv('MNCAATourneySeeds.csv')
+submission = load_csv('SampleSubmissionStage2.csv')
+
+# Advanced Feature Engineering
+def preprocess_data(regular_season_results, tourney_results, seeds):
+    all_games = pd.concat([
+        regular_season_results[['WTeamID', 'LTeamID', 'WScore', 'LScore', 'NumOT']],
+        tourney_results[['WTeamID', 'LTeamID', 'WScore', 'LScore', 'NumOT']]
+    ])
+
+    team_stats = all_games.groupby('WTeamID').agg({
+        'WScore': ['mean', 'std', 'max', 'min'],
+        'LScore': ['mean', 'std', 'max', 'min'],
+        'NumOT': ['sum']
+    }).reset_index()
+    team_stats.columns = ['TeamID', 'AvgWinScore', 'StdWinScore', 'MaxWinScore', 'MinWinScore', 'AvgLossScore', 'StdLossScore', 'MaxLossScore', 'MinLossScore', 'TotalOTWins']
+    team_stats = team_stats.fillna(0)
+
+    # Merge seed information
+    seeds['Seed'] = seeds['Seed'].str.extract(r'(\d+)')
+    seeds['Seed'] = pd.to_numeric(seeds['Seed'], errors='coerce').fillna(20)
+
+    team_stats = team_stats.merge(seeds[['TeamID', 'Seed']], on='TeamID', how='left').fillna({'Seed': 20})
+
+    merged = tourney_results.merge(team_stats, left_on='WTeamID', right_on='TeamID', how='left')
+    merged = merged.merge(team_stats, left_on='LTeamID', right_on='TeamID', how='left', suffixes=('_W', '_L'))
+    merged = merged.fillna(0)
+
+    merged['Result'] = 1
+    inverse_matches = merged.rename(columns={'WTeamID': 'LTeamID', 'LTeamID': 'WTeamID'})
+    inverse_matches['Result'] = 0
+    merged = pd.concat([merged, inverse_matches], ignore_index=True)
+
+    labels = merged['Result']
+    features = merged.drop(columns=['WTeamID', 'LTeamID', 'TeamID_W', 'TeamID_L', 'Result'])
+
+    features = features.apply(pd.to_numeric, errors='coerce').fillna(0).astype(np.float32)
+
+    return features, labels, team_stats
+
+training_data, labels, team_stats = preprocess_data(regular_season_results, tourney_results, seeds)
+
+X_train, X_val, y_train, y_val = train_test_split(training_data, labels, test_size=0.2, random_state=42, stratify=labels)
+
+# Enhanced Model with Hyperparameter Tuning
+base_models = [
+    ('RandomForest', RandomForestClassifier(n_estimators=100, random_state=42, max_depth=6, class_weight="balanced", n_jobs=-1)),
+    ('GradientBoosting', GradientBoostingClassifier(n_estimators=100, random_state=42, max_depth=6, subsample=0.8)),
+    ('AdaBoost', AdaBoostClassifier(n_estimators=100, random_state=42)),
+    ('XGBoost', XGBClassifier(n_estimators=100, random_state=42, use_label_encoder=False, eval_metric='logloss', max_depth=6, subsample=0.8, colsample_bytree=0.8, tree_method='hist', n_jobs=-1)),
+    ('LightGBM', LGBMClassifier(n_estimators=100, random_state=42, max_depth=6, subsample=0.8, colsample_bytree=0.8, n_jobs=-1))
+]
+
+meta_model = LGBMClassifier(n_estimators=150, random_state=42, max_depth=8, n_jobs=-1)
+stacking_model = StackingClassifier(estimators=base_models, final_estimator=meta_model, passthrough=True, n_jobs=-1)
+
+pipeline = Pipeline([
+    ('scaler', StandardScaler()),
+    ('model', stacking_model)
+])
+pipeline.fit(X_train, y_train)
+
+val_predictions = pipeline.predict_proba(X_val)[:, 1]
+validation_loss = log_loss(y_val, val_predictions)
+brier_score = brier_score_loss(y_val, val_predictions)
+print(f'Stacking Model Validation Log Loss: {validation_loss}')
+print(f'Stacking Model Brier Score Loss: {brier_score}')
+print('Classification Report:')
+print(classification_report(y_val, (val_predictions > 0.5).astype(int)))
+
+# Prepare test data based on Kaggle submission format
+submission[['Team1', 'Team2']] = submission['ID'].str.split('_', n=1, expand=True)
+submission['Team1'] = submission['Team1'].astype(int)
+submission['Team2'] = submission['Team2'].astype(int)
+
+test_set = submission.merge(team_stats, left_on='Team1', right_on='TeamID', how='left')
+test_set = test_set.merge(team_stats, left_on='Team2', right_on='TeamID', how='left', suffixes=('_T1', '_T2'))
+test_set = test_set.drop(columns=['ID', 'TeamID_T1', 'TeamID_T2'])
+
+test_set = test_set.apply(pd.to_numeric, errors='coerce').fillna(0).astype(np.float32)
+
+
+# Make predictions on properly formatted test set
+test_predictions = pipeline.predict_proba(test_set)[:, 1]
+submission['Pred'] = test_predictions
+submission.to_csv('submission7.csv', index=False)
+print("Submission file 'submission7.csv' created successfully!")
